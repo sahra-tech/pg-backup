@@ -28,6 +28,8 @@ ENV PATH="/usr/libexec/postgresql:$PATH"
 WORKDIR /app
 
 COPY --from=builder /app/pg-backup .
-COPY config.yaml .
+
+# Expect config.yaml to be mounted at runtime
+# Use volume mount: -v /path/to/config.yaml:/app/config.yaml
 
 CMD ["./pg-backup"]
