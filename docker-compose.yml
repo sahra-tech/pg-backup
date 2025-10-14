@@ -2,6 +2,7 @@ services:
   pg-backup:
     build: .
     container_name: pg-backup
+    restart: always
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./backups:/app/backups
