@@ -2,8 +2,10 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -12,38 +14,62 @@ type Logger struct {
 	logger *log.Logger
 }
 
-func New(filename string) *Logger {
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("Failed to open log file: %v", err)
+// New returns a Logger that always writes to stderr, so `docker logs`,
+// journald and any other supervisor see backup activity without extra setup.
+// When filename is non-empty, output is additionally teed to that file.
+//
+// The returned Logger is ALWAYS usable. If the file cannot be opened, the
+// Logger falls back to stderr-only and the error explains why: a log-file
+// permission problem must never stop backups from running.
+func New(filename string) (*Logger, error) {
+	stderrOnly := &Logger{logger: log.New(os.Stderr, "", 0)}
+	if filename == "" {
+		return stderrOnly, nil
 	}
 
-	logger := log.New(file, "", 0)
+	if dir := filepath.Dir(filename); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return stderrOnly, fmt.Errorf("cannot create log directory %s: %w", dir, err)
+		}
+	}
+
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	if err != nil {
+		return stderrOnly, fmt.Errorf("cannot open log file %s: %w", filename, err)
+	}
 
 	return &Logger{
 		file:   file,
-		logger: logger,
-	}
+		logger: log.New(io.MultiWriter(file, os.Stderr), "", 0),
+	}, nil
 }
 
-func (l *Logger) Info(format string, args ...interface{}) {
+// NewTo builds a Logger writing to w, with no file backing it. Intended for
+// tests and for callers that manage their own output.
+func NewTo(w io.Writer) *Logger {
+	return &Logger{logger: log.New(w, "", 0)}
+}
+
+func (l *Logger) Info(format string, args ...any) {
 	l.log("INFO", format, args...)
 }
 
-func (l *Logger) Error(format string, args ...interface{}) {
+func (l *Logger) Error(format string, args ...any) {
 	l.log("ERROR", format, args...)
 }
 
-func (l *Logger) Warning(format string, args ...interface{}) {
+func (l *Logger) Warning(format string, args ...any) {
 	l.log("WARNING", format, args...)
 }
 
-func (l *Logger) log(level, format string, args ...interface{}) {
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	message := fmt.Sprintf(format, args...)
-	l.logger.Printf("[%s] %s: %s", timestamp, level, message)
+func (l *Logger) log(level, format string, args ...any) {
+	timestamp := time.Now().Format(time.RFC3339)
+	l.logger.Printf("[%s] %s: %s", timestamp, level, fmt.Sprintf(format, args...))
 }
 
 func (l *Logger) Close() error {
+	if l.file == nil {
+		return nil
+	}
 	return l.file.Close()
 }

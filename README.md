@@ -1,148 +1,201 @@
 # PostgreSQL Backup Application
 
-A robust Go application for automatically backing up PostgreSQL databases with flexible storage options and comprehensive monitoring.
+A Go service that backs up PostgreSQL databases on a schedule, compresses them, ships them to local
+disk or S3, and prunes them when they expire.
 
 ## Features
 
-- **Flexible Database Selection**: Backup specific databases or automatically discover and backup ALL databases
-- **Full Dump Mode**: Create a single backup file containing all databases, roles, and tablespaces using pg_dumpall
-- **Multiple Storage Options**: Local filesystem or AWS S3 bucket
-- **Scheduled Backups**: Configurable cron-based scheduling
-- **Compression**: Automatic gzip compression of backup files
-- **Health Monitoring**: HTTP endpoints for health checks and status monitoring
-- **Manual Backup Trigger**: HTTP API to trigger backups on-demand
-- **Comprehensive Logging**: Detailed logs with timestamps and operation tracking
-- **Docker Support**: Ready for containerized deployment
-- **CLI Interface**: Command-line options for manual operations
+- **Flexible Database Selection**: Back up specific databases, or discover and back up all of them
+- **Full Dump Mode**: A single `pg_dumpall` file containing every database, role, and tablespace
+- **Multiple Storage Options**: Local filesystem or S3 (including S3-compatible endpoints), via AWS SDK for Go v2
+- **Scheduled Backups**: Cron-based scheduling, validated at startup
+- **Streaming Compression**: gzip applied as the dump streams, so memory stays flat on large clusters
+- **Retention**: Expired backups are pruned automatically after each successful run
+- **Health Monitoring**: HTTP endpoints for health, status, and manual triggering
+- **Atomic Writes**: An interrupted or failed dump never leaves a partial file behind
+- **Graceful Shutdown**: SIGTERM stops the scheduler and cleans up in-flight work
+- **Docker Support**: Non-root image with a built-in healthcheck
 
 ## Quick Start
 
-1. **Build the application:**
+1. **Build:**
 
    ```bash
    make build
-   # or
-   go build -o pg-backup .
    ```
 
-2. **Configure your backup:**
+2. **Configure:**
 
    ```bash
-   cp config.example.yaml config.yaml
-   # Edit config.yaml with your settings
+   cp .env.example .env
    ```
 
 3. **Run a test backup:**
 
    ```bash
-   ./pg-backup -once
+   ./pg-backup --env-file .env -once
    ```
 
 4. **Start the scheduler:**
+
    ```bash
-   ./pg-backup
+   ./pg-backup --env-file .env
    ```
 
 ## Configuration
 
-### Specific Databases
+All settings come from the environment. Standard PostgreSQL (`PG*`) and AWS (`AWS_*`) variables are
+used where they exist; everything else is prefixed `PG_BACKUP_`.
 
-```yaml
-database:
-  host: "localhost"
-  port: 5432
-  user: "postgres"
-  password: "postgres"
-  databases:
-    - "database1"
-    - "database2"
+Copy [.env.example](.env.example) and edit it:
+
+```bash
+cp .env.example .env
 ```
 
-### Full Server Backup (Individual Files)
+Then supply it however suits the deployment:
 
-```yaml
-database:
-  host: "localhost"
-  port: 5432
-  user: "postgres"
-  password: "postgres"
-  databases: [] # Empty = backup ALL databases
-full_dump: false # Each database backed up separately
+```bash
+docker compose up -d              # compose reads .env via env_file
+./pg-backup --env-file .env       # ad-hoc CLI runs
+set -a && source .env && set +a   # plain shell
 ```
 
-### Full Server Backup (Single File)
+Variables already present in the environment always win over `--env-file`, so an orchestrator or an
+operator can override a checked-in default without editing the file.
 
-```yaml
-database:
-  host: "localhost"
-  port: 5432
-  user: "postgres"
-  password: "postgres"
-  databases: [] # Ignored when full_dump is true
-full_dump: true # Creates single file with all databases, roles, and tablespaces
-```
+Every problem is reported at once, so a mistyped deployment learns about all of its errors in a
+single run rather than one restart at a time.
 
-### Storage Options
+### Reference
 
-**Local Storage:**
+| Variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `PGHOST` | yes | — | Database host |
+| `PGUSER` | yes | — | Database user |
+| `PGPORT` | no | `5432` | Database port |
+| `PGPASSWORD` | no | — | Database password |
+| `PGSSLMODE` | no | `prefer` | `disable`\|`allow`\|`prefer`\|`require`\|`verify-ca`\|`verify-full` |
+| `PG_BACKUP_DATABASES` | no | all | Comma-separated list; empty discovers every database |
+| `PG_BACKUP_STORAGE_TYPE` | yes | — | `local` or `s3` |
+| `PG_BACKUP_LOCAL_PATH` | if local | — | Directory for backups |
+| `PG_BACKUP_S3_BUCKET` | if s3 | — | Bucket name |
+| `AWS_REGION` | no | `us-east-1` | Region |
+| `AWS_ACCESS_KEY_ID` | if s3 | — | Access key |
+| `AWS_SECRET_ACCESS_KEY` | if s3 | — | Secret key |
+| `PG_BACKUP_S3_ENDPOINT` | no | AWS | Custom endpoint; bare host is fine |
+| `PG_BACKUP_SCHEDULE` | yes | — | Cron, or `@daily` / `@every 6h` |
+| `PG_BACKUP_LOG_FILE` | no | — | Extra log file; stderr always receives logs |
+| `PG_BACKUP_RUN_ON_START` | no | `false` | Back up immediately at startup |
+| `PG_BACKUP_RETENTION_DAYS` | no | `30` | Prune older backups; `0` disables |
+| `PG_BACKUP_FULL_DUMP` | no | `false` | Single `pg_dumpall` file for the cluster |
+| `PG_BACKUP_COMPRESSION_LEVEL` | no | `-1` | `-1` default, `0` none, `1`–`9` |
+| `PG_BACKUP_HEALTH_PORT` | no | `8080` | Health server port |
+| `PG_BACKUP_HEALTH_BIND` | no | all | `127.0.0.1` restricts to loopback |
+| `PG_BACKUP_TRIGGER_TOKEN` | no | — | Bearer token for `POST /trigger` |
 
-```yaml
-storage:
-  type: "local"
-  local:
-    path: "./backups"
-```
-
-**S3 Storage:**
-
-```yaml
-storage:
-  type: "s3"
-  s3:
-    bucket: "my-backup-bucket"
-    region: "us-east-1"
-    access_key: "ACCESS_KEY"
-    secret_key: "SECRET_KEY"
-```
+`PG_BACKUP_DATABASES` is comma-separated, so a database whose name contains a comma cannot be listed
+there; leave the variable empty to have such a database discovered automatically.
 
 ## Commands
 
-- `./pg-backup -list` - List configured databases
-- `./pg-backup -once` - Run backup once and exit
-- `./pg-backup -config custom.yaml` - Use custom configuration
-- `./pg-backup -h` - Show help
+- `./pg-backup` — start the scheduler
+- `./pg-backup -once` — run one backup and exit (exit code 1 if anything failed)
+- `./pg-backup -list` — list configured databases
+- `./pg-backup --env-file .env` — load a `KEY=value` file before reading configuration
 
-## Manual Backup Trigger
+## Backup Modes
 
-Trigger a backup manually via HTTP API while the scheduler is running:
+### Individual Database Backups (`full_dump: false`)
 
-```bash
-# Using curl
-curl -X POST http://localhost:8080/trigger
+Runs `pg_dump` per database and writes one `.sql.gz` each, which allows selective restores. If one
+database fails the others still run; the process reports which ones failed and exits non-zero.
 
-# Using the provided script
-./trigger-backup.sh
+### Full Dump Mode (`full_dump: true`)
+
+Runs `pg_dumpall` once and writes a single `.sql.gz` containing every database plus roles,
+tablespaces, and other global objects. Required for a complete cluster restore including
+permissions. The `databases` list is ignored in this mode.
+
+## S3 and S3-compatible storage
+
+Uploads use multipart transfer, which means:
+
+- No 5GB object-size limit.
+- Memory stays bounded (~64MB of upload buffers) regardless of dump size.
+- Each part is retried independently, so one flaky request does not restart the
+  whole upload.
+
+Transient gateway failures (HTTP 500/502/503/504) are retried up to 6 times, above the SDK default
+of 3, because CDN/proxy layers in front of S3-compatible stores return them far more often than AWS
+S3 does. If the upload still fails, the incomplete multipart upload is aborted so no orphaned parts
+are billed.
+
+> If uploads are ever killed abruptly (SIGKILL, power loss), the abort cannot run. Configuring a
+> bucket lifecycle rule to expire incomplete multipart uploads after a day or two is good practice.
+
+`PG_BACKUP_S3_ENDPOINT` may be given as a bare host (`s3.example.com`) or with a scheme
+(`https://s3.example.com`). Bucket addressing is virtual-host style, matching the previous
+behaviour.
+
+### Diagnosing upload failures
+
+A gateway in front of the object store answers outages with an HTML error page rather than an S3
+XML `<Error>`. Errors now name the HTTP status and the endpoint up front:
+
+```
+s3 upload of full_dump_....sql.gz failed: endpoint https://s3.example.com returned HTTP 502.
+This is a gateway/upstream failure at the storage provider, not a credentials problem;
+it was retried 6 times: ...
 ```
 
-**Response on success (202 Accepted):**
+An HTTP 5xx here is the provider's problem, not a misconfiguration on your side. Persistent 502s
+usually mean the storage endpoint or the CDN in front of it is unhealthy.
 
-```json
-{
-  "status": "accepted",
-  "message": "Backup started successfully",
-  "started_at": "2024-08-05 18:30:45"
-}
-```
+## Retention
 
-The backup runs asynchronously in the background. Check the logs or use the `/status` endpoint to monitor progress.
+After every **successful** run, backups older than `retention_days` are deleted. Two guard rails
+apply:
+
+- The sweep is skipped entirely if any part of the run failed, so old copies are never removed when
+  a fresh backup might be missing.
+- Only files matching this tool's own naming pattern (`<name>_<timestamp>[_<suffix>].sql.gz`) are
+  ever considered, so a shared bucket or directory is safe.
+
+Set `PG_BACKUP_RETENTION_DAYS=0` to disable pruning.
 
 ## Health Monitoring
 
-When running, the application provides HTTP endpoints:
+- `GET /health` — liveness check
+- `GET /status` — last/next backup time, uptime, counters, whether a backup is running
+- `POST /trigger` — start a backup immediately
 
-- `http://localhost:8080/health` - Basic health check
-- `http://localhost:8080/status` - Detailed status information
-- `http://localhost:8080/trigger` - Manually trigger a backup (POST only)
+```bash
+curl http://localhost:8080/status
+```
+
+### Manual trigger
+
+```bash
+export PG_BACKUP_TRIGGER_TOKEN=your-token
+./trigger-backup.sh
+```
+
+Or directly:
+
+```bash
+curl -X POST -H "Authorization: Bearer $PG_BACKUP_TRIGGER_TOKEN" http://localhost:8080/trigger
+```
+
+Responses: `202` accepted, `409` a backup is already running, `401` bad or missing token,
+`405` wrong method.
+
+> **Security:** `/trigger` starts real work against your database. Set `PG_BACKUP_TRIGGER_TOKEN`,
+> and/or set `PG_BACKUP_HEALTH_BIND=127.0.0.1`. The shipped `docker-compose.yml` publishes the port on loopback
+> only. The service warns at startup if no token is configured.
+
+Only one backup runs at a time; overlapping schedules and triggers are rejected with `409` rather
+than stacking concurrent dumps.
 
 ## Docker Deployment
 
@@ -151,71 +204,43 @@ make docker-build
 make docker-run
 ```
 
-## Configuration Files
+Built on `golang:1.27-alpine`, running on `alpine:3.24`. The image runs as an unprivileged user
+(uid 65532) and includes a `HEALTHCHECK` against `/health`.
+Mounted `backups/` and `logs/` directories must be writable by that uid.
 
-- `config.example.yaml` - Example with specific databases
-- `config.full-dump.example.yaml` - Example for full server backup (individual files per database)
-- `config.full-dump-single-file.example.yaml` - Example for full server backup (single file with pg_dumpall)
-- `config.s3.example.yaml` - Example with S3 storage
+### Logs
 
-## Backup Modes
+Logs always go to **stderr**, so they appear in `docker logs pg-backup`, journald, or whatever your
+supervisor collects — no configuration, no volume, and no `docker exec` needed.
 
-### Individual Database Backups
+`PG_BACKUP_LOG_FILE` is optional and only adds a second destination. If you set it, the path must be
+writable by uid 65532 (the container runs unprivileged); a bind mount keeps its host-side ownership,
+which the image's own `chown` cannot change. If the file cannot be opened, pg-backup logs a warning
+and carries on with stderr only — a log-file permission problem never stops a backup.
 
-- Uses `pg_dump` for each database
-- Creates separate `.sql.gz` files for each database
-- Allows selective restoration of specific databases
-- Faster for partial restores
+## Development
 
-### Full Dump Mode
+```bash
+make check   # gofmt, go vet, go test -race
+```
 
-- Uses `pg_dumpall` to create a complete cluster backup
-- Creates a single `.sql.gz` file containing everything
-- Includes all databases, roles, tablespaces, and global objects
-- Required for complete server restoration including user roles and permissions
-- Enabled by setting `full_dump: true` in configuration
+`go.mod` declares Go 1.24 as the **minimum**; CI and the Docker image build with 1.27.
 
 ## Troubleshooting
 
-### PostgreSQL Client Tools Not Found
+**Connection issues.** Verify host, port, user, and password. Check that the server accepts
+connections from the backup host (`pg_hba.conf`, firewall). If the server requires TLS, set
+`sslmode: require` or stricter.
 
-If you encounter errors like:
+**`pg_dump`/`pg_dumpall` not found.** Install the PostgreSQL client tools and ensure they are on
+`PATH`:
 
+```bash
+sudo apt-get install postgresql-client   # Debian/Ubuntu
+brew install libpq                       # macOS
 ```
-pg_dumpall: error: program "pg_dump" is needed by pg_dumpall but was not found
-```
 
-**For Docker deployments:**
+The Docker image installs `postgresql17-client` and puts `/usr/libexec/postgresql` on `PATH`.
 
-1. Rebuild the Docker image to ensure PostgreSQL client tools are properly installed
-2. The Dockerfile uses `postgresql15-client` package which should include all necessary tools
-
-**For manual installations:**
-
-1. Install PostgreSQL client tools:
-
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install postgresql-client
-
-   # CentOS/RHEL
-   sudo yum install postgresql
-
-   # macOS
-   brew install postgresql
-   ```
-
-2. Ensure `pg_dump` and `pg_dumpall` are in your PATH:
-   ```bash
-   which pg_dump
-   which pg_dumpall
-   ```
-
-**Workaround:**
-If `pg_dumpall` is not available, you can disable full dump mode by setting `full_dump: false` in your configuration. This will backup each database individually using `pg_dump`.
-
-### Connection Issues
-
-- Verify database host, port, username, and password in configuration
-- Ensure the PostgreSQL server allows connections from your backup location
-- Check firewall settings and pg_hba.conf configuration
+**Backups fail for one database but not others.** Each database is dumped independently. The error
+log names the failing database and includes `pg_dump` stderr; the remaining databases still run.

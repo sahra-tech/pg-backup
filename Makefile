@@ -1,4 +1,4 @@
-.PHONY: build run clean docker-build docker-run docker-stop deps test help
+.PHONY: build run test-run list clean docker-build docker-run docker-stop deps test check validate-config help
 
 # Build the application
 build:
@@ -21,6 +21,7 @@ clean:
 	rm -f pg-backup
 	rm -rf backups/
 	rm -f backup.log
+	rm -rf logs/
 
 # Build Docker image
 docker-build:
@@ -39,13 +40,19 @@ deps:
 	go mod tidy
 	go mod download
 
-# Run tests
+# Run tests (race detector on: the health service is concurrent)
 test:
-	go test ./...
+	go test -race ./...
 
-# Validate configuration
+# Everything CI runs
+check: build
+	gofmt -l . | tee /dev/stderr | (! read)
+	go vet ./...
+	go test -race ./...
+
+# Validate configuration from .env
 validate-config: build
-	./pg-backup -config config.example.yaml -list
+	./pg-backup --env-file .env -list
 
 # Show help
 help:
@@ -57,9 +64,8 @@ help:
 	@echo "  clean         - Clean build artifacts"
 	@echo "  docker-build  - Build Docker image"
 	@echo "  docker-run    - Run with Docker Compose"
-	@echo "  docker-run-full - Run full environment with PostgreSQL"
 	@echo "  docker-stop   - Stop Docker containers"
-	@echo "  docker-stop-full - Stop full environment"
 	@echo "  deps          - Download dependencies"
-	@echo "  test          - Run tests"
-	@echo "  validate-config - Validate configuration files"
+	@echo "  test          - Run tests with the race detector"
+	@echo "  check         - Run everything CI runs (fmt, vet, test)"
+	@echo "  validate-config - Load .env and list configured databases"

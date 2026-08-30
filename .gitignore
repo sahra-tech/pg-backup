@@ -1,6 +1,5 @@
 pg-backup
-config.yaml
+.env
 backups/
 *.log
-.env
 .DS_Store

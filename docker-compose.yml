@@ -3,17 +3,28 @@ services:
     build: .
     container_name: pg-backup
     restart: always
+    # All configuration comes from the environment. Copy .env.example to .env.
+    env_file:
+      - .env
     volumes:
-      - ./config.yaml:/app/config.yaml:ro  # Mount config as read-only
       - ./backups:/app/backups
-      - ./logs:/app/logs
+      # Logs go to stderr, so `docker logs pg-backup` works with no mount.
+      # Add one only if you also set PG_BACKUP_LOG_FILE, and note the container
+      # runs as uid 65532, which must be able to write the mounted directory.
+      # - ./logs:/app/logs
     environment:
       - TZ=UTC
-    networks:
-      - pg-backup_test-network
+      # Overrides .env; useful for secrets held only in the host environment.
+      # - PGPASSWORD=${PGPASSWORD}
+      # - PG_BACKUP_TRIGGER_TOKEN=${PG_BACKUP_TRIGGER_TOKEN}
     ports:
-      - "8080:8080"
+      # Bound to loopback: POST /trigger starts a backup. Publish it more
+      # widely only with PG_BACKUP_TRIGGER_TOKEN set.
+      - "127.0.0.1:8080:8080"
 
-networks:
-  pg-backup_test-network:
-    external: true
+    # If PostgreSQL runs in another compose project, attach to its network:
+    # networks:
+    #   - pg-network
+# networks:
+#   pg-network:
+#     external: true

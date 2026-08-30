@@ -3,9 +3,16 @@ package backup
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,26 +23,53 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// timestampLayout is kept stable so that files written by older versions are
+// still recognised by backupFilePattern and remain eligible for pruning.
+const timestampLayout = "2006-01-02_15-04-05"
+
+// backupFilePattern matches files this tool created. The retention sweep only
+// ever deletes names matching it, so pointing the tool at a shared bucket or
+// directory cannot destroy unrelated data. The trailing suffix group is
+// optional to keep matching files written before suffixes were added.
+var backupFilePattern = regexp.MustCompile(`_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_[0-9a-f]{6})?\.sql\.gz$`)
+
 type Service struct {
-	dbConfig *config.Config
-	storage  storage.Provider
-	logger   *logger.Logger
+	cfg     *config.Config
+	storage storage.Provider
+	logger  *logger.Logger
 }
 
-func NewService(dbConfig *config.Config, storage storage.Provider, logger *logger.Logger) *Service {
+func NewService(cfg *config.Config, store storage.Provider, log *logger.Logger) *Service {
 	return &Service{
-		dbConfig: dbConfig,
-		storage:  storage,
-		logger:   logger,
+		cfg:     cfg,
+		storage: store,
+		logger:  log,
 	}
 }
 
-func (s *Service) BackupAll() (int, error) {
-	// Check if full dump is enabled
-	if s.dbConfig.FullDump {
+// BackupAll runs one backup cycle and, if nothing failed, prunes expired
+// backups. It returns the number of targets successfully backed up.
+func (s *Service) BackupAll(ctx context.Context) (int, error) {
+	succeeded, err := s.runCycle(ctx)
+
+	if err != nil {
+		// Never prune after a partial cycle: we may not have written a fresh
+		// backup of everything we are about to delete old copies of.
+		s.logger.Warning("Skipping retention sweep because this cycle reported failures")
+		return succeeded, err
+	}
+
+	if pruneErr := s.pruneOldBackups(ctx); pruneErr != nil {
+		// The backup itself succeeded; a failed sweep must not mask that.
+		s.logger.Error("Retention sweep failed: %v", pruneErr)
+	}
+	return succeeded, nil
+}
+
+func (s *Service) runCycle(ctx context.Context) (int, error) {
+	if s.cfg.FullDump {
 		s.logger.Info("Full dump mode enabled, creating single backup file for entire server")
-		err := s.backupFullServer()
-		if err != nil {
+		if err := s.backupFullServer(ctx); err != nil {
 			s.logger.Error("Failed to perform full dump: %v", err)
 			return 0, err
 		}
@@ -43,66 +77,91 @@ func (s *Service) BackupAll() (int, error) {
 		return 1, nil
 	}
 
-	databases := s.dbConfig.Database.Databases
+	databases := s.cfg.Database.Databases
 
-	// If no databases specified, discover all databases
 	if len(databases) == 0 {
 		s.logger.Info("No specific databases configured, discovering all databases")
-		discoveredDbs, err := s.discoverDatabases()
+		discovered, err := s.discoverDatabases(ctx)
 		if err != nil {
 			s.logger.Error("Failed to discover databases: %v", err)
 			return 0, err
 		}
-		databases = discoveredDbs
+		databases = discovered
 		s.logger.Info("Discovered %d databases: %s", len(databases), strings.Join(databases, ", "))
 	}
 
+	// Back up everything we can, then report the failures together. Aborting on
+	// the first error would silently skip every remaining database.
+	var (
+		succeeded int
+		failures  []error
+	)
 	for _, database := range databases {
-		s.logger.Info("Starting backup for database: %s", database)
-
-		err := s.backupDatabase(database)
-		if err != nil {
-			s.logger.Error("Failed to backup database %s: %v", database, err)
-			return 0, err
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, fmt.Errorf("aborted before %q: %w", database, err))
+			break
 		}
 
+		s.logger.Info("Starting backup for database: %s", database)
+		if err := s.backupDatabase(ctx, database); err != nil {
+			s.logger.Error("Failed to backup database %s: %v", database, err)
+			failures = append(failures, fmt.Errorf("database %q: %w", database, err))
+			continue
+		}
+		succeeded++
 		s.logger.Info("Successfully backed up database: %s", database)
 	}
 
-	return len(databases), nil
+	if len(failures) > 0 {
+		return succeeded, fmt.Errorf("%d of %d databases failed: %w",
+			len(failures), len(databases), errors.Join(failures...))
+	}
+	return succeeded, nil
 }
 
-func (s *Service) discoverDatabases() ([]string, error) {
-	connStr := fmt.Sprintf("host=%s port=%d user=%s dbname=postgres sslmode=disable",
-		s.dbConfig.Database.Host,
-		s.dbConfig.Database.Port,
-		s.dbConfig.Database.User,
-	)
+// quoteDSNValue renders a libpq connection-string value safely. Without this a
+// password containing a space or quote would truncate the DSN or inject
+// adjacent parameters.
+func quoteDSNValue(v string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+	return "'" + replacer.Replace(v) + "'"
+}
 
-	if s.dbConfig.Database.Password != "" {
-		connStr += fmt.Sprintf(" password=%s", s.dbConfig.Database.Password)
+func (s *Service) connString(dbname string) string {
+	parts := []string{
+		"host=" + quoteDSNValue(s.cfg.Database.Host),
+		fmt.Sprintf("port=%d", s.cfg.Database.Port),
+		"user=" + quoteDSNValue(s.cfg.Database.User),
+		"dbname=" + quoteDSNValue(dbname),
+		"sslmode=" + quoteDSNValue(s.cfg.Database.SSLMode),
 	}
+	if s.cfg.Database.Password != "" {
+		parts = append(parts, "password="+quoteDSNValue(s.cfg.Database.Password))
+	}
+	return strings.Join(parts, " ")
+}
 
-	db, err := sql.Open("postgres", connStr)
+func (s *Service) discoverDatabases(ctx context.Context) ([]string, error) {
+	db, err := sql.Open("postgres", s.connString("postgres"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
 	}
 	defer db.Close()
 
-	err = db.Ping()
-	if err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("failed to ping PostgreSQL: %w", err)
 	}
 
-	query := `
-		SELECT datname 
-		FROM pg_database 
-		WHERE datistemplate = false 
+	const query = `
+		SELECT datname
+		FROM pg_database
+		WHERE datistemplate = false
+		AND datallowconn = true
 		AND datname NOT IN ('postgres')
 		ORDER BY datname
 	`
 
-	rows, err := db.Query(query)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query databases: %w", err)
 	}
@@ -111,13 +170,11 @@ func (s *Service) discoverDatabases() ([]string, error) {
 	var databases []string
 	for rows.Next() {
 		var dbName string
-		err := rows.Scan(&dbName)
-		if err != nil {
+		if err := rows.Scan(&dbName); err != nil {
 			return nil, fmt.Errorf("failed to scan database name: %w", err)
 		}
 		databases = append(databases, dbName)
 	}
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating database rows: %w", err)
 	}
@@ -125,164 +182,212 @@ func (s *Service) discoverDatabases() ([]string, error) {
 	return databases, nil
 }
 
-func (s *Service) backupDatabase(database string) error {
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	filename := fmt.Sprintf("%s_%s.sql.gz", database, timestamp)
+// dumpEnv extends the process environment rather than replacing it. Assigning
+// to a nil cmd.Env would hand the child a single-variable environment with no
+// PATH, TZ or locale -- which is why pg_dumpall could not find pg_dump.
+func (s *Service) dumpEnv() []string {
+	env := os.Environ()
+	if s.cfg.Database.Password != "" {
+		env = append(env, "PGPASSWORD="+s.cfg.Database.Password)
+	}
+	return env
+}
 
-	cmd := exec.Command("pg_dump",
-		"-h", s.dbConfig.Database.Host,
-		"-p", fmt.Sprintf("%d", s.dbConfig.Database.Port),
-		"-U", s.dbConfig.Database.User,
+func timestampedName(prefix string) string {
+	var suffix [3]byte
+	// A short random suffix keeps a manual trigger from overwriting a scheduled
+	// backup that started in the same second.
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Sprintf("%s_%s.sql.gz", prefix, time.Now().UTC().Format(timestampLayout))
+	}
+	return fmt.Sprintf("%s_%s_%s.sql.gz",
+		prefix, time.Now().UTC().Format(timestampLayout), hex.EncodeToString(suffix[:]))
+}
+
+func (s *Service) backupDatabase(ctx context.Context, database string) error {
+	cmd := exec.CommandContext(ctx, "pg_dump",
+		"-h", s.cfg.Database.Host,
+		"-p", fmt.Sprintf("%d", s.cfg.Database.Port),
+		"-U", s.cfg.Database.User,
 		"-d", database,
 		"--no-password",
 	)
+	cmd.Env = s.dumpEnv()
 
-	if s.dbConfig.Database.Password != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PGPASSWORD=%s", s.dbConfig.Database.Password))
+	return s.runDump(ctx, cmd, timestampedName(database), "pg_dump")
+}
+
+func (s *Service) backupFullServer(ctx context.Context) error {
+	if _, err := exec.LookPath("pg_dumpall"); err != nil {
+		s.logger.Error("pg_dumpall not found on PATH. Full dump requires the PostgreSQL client tools.")
+		s.logger.Error("Set full_dump: false to back up each database individually with pg_dump.")
+		return fmt.Errorf("pg_dumpall not available: %w", err)
 	}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	cmd := exec.CommandContext(ctx, "pg_dumpall",
+		"-h", s.cfg.Database.Host,
+		"-p", fmt.Sprintf("%d", s.cfg.Database.Port),
+		"-U", s.cfg.Database.User,
+		"--no-password",
+	)
+	cmd.Env = s.dumpEnv()
+
+	return s.runDump(ctx, cmd, timestampedName("full_dump"), "pg_dumpall")
+}
+
+// countingWriter records how many bytes passed through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// runDump streams the command's stdout through gzip straight into storage,
+// so peak memory stays flat regardless of dump size. If the command exits
+// non-zero the pipe is closed with an error, which makes the storage provider
+// discard the partial object instead of committing a truncated backup.
+func (s *Service) runDump(ctx context.Context, cmd *exec.Cmd, filename, tool string) error {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to open %s stdout: %w", tool, err)
+	}
+
+	// stderr stays buffered: it is small and needed for error messages.
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	s.logger.Info("Executing pg_dump for database: %s", database)
+	s.logger.Info("Executing %s -> %s", tool, filename)
 	start := time.Now()
 
-	err := cmd.Run()
-	if err != nil {
-		s.logger.Error("pg_dump failed for database %s: %v, stderr: %s", database, err, stderr.String())
-		return fmt.Errorf("pg_dump failed: %w", err)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start %s: %w", tool, err)
 	}
 
-	duration := time.Since(start)
-	s.logger.Info("pg_dump completed for database %s in %v", database, duration)
+	pr, pw := io.Pipe()
+	var (
+		rawBytes   int64
+		dumpErr    error
+		compressed = &countingWriter{w: pw}
+		done       = make(chan struct{})
+	)
+
+	go func() {
+		defer close(done)
+
+		gz, err := gzip.NewWriterLevel(compressed, s.cfg.Compression())
+		if err != nil {
+			dumpErr = err
+			pw.CloseWithError(err)
+			// Drain stdout first: Wait would otherwise block if the child
+			// filled the pipe buffer.
+			_, _ = io.Copy(io.Discard, stdout)
+			_ = cmd.Wait()
+			return
+		}
+
+		rawBytes, err = io.Copy(gz, stdout)
+		copyErr := err
+		closeErr := gz.Close()
+
+		// Wait only after stdout is drained, and only decide the stream was
+		// clean once the exit status is known.
+		waitErr := cmd.Wait()
+
+		switch {
+		case copyErr != nil:
+			dumpErr = fmt.Errorf("failed reading %s output: %w", tool, copyErr)
+		case waitErr != nil:
+			dumpErr = fmt.Errorf("%s failed: %w (stderr: %s)",
+				tool, waitErr, strings.TrimSpace(stderr.String()))
+		case closeErr != nil:
+			dumpErr = fmt.Errorf("failed to finish compression: %w", closeErr)
+		}
+		if dumpErr != nil {
+			pw.CloseWithError(dumpErr)
+			return
+		}
+		pw.Close()
+	}()
+
+	storeErr := s.storage.Store(ctx, filename, pr)
+	// Unblock the writer if Store bailed out before draining the pipe.
+	pr.CloseWithError(storeErr)
+	<-done
+
+	// A failing dump surfaces at the provider as a read error, so report the
+	// dump's own error rather than blaming storage for it.
+	if dumpErr != nil {
+		return dumpErr
+	}
+	if storeErr != nil {
+		return fmt.Errorf("failed to store backup %s: %w", filename, storeErr)
+	}
 
 	if stderr.Len() > 0 {
-		s.logger.Warning("pg_dump warnings for database %s: %s", database, stderr.String())
+		s.logger.Warning("%s warnings: %s", tool, strings.TrimSpace(stderr.String()))
 	}
 
-	var compressed bytes.Buffer
-	gzipWriter := gzip.NewWriter(&compressed)
-	_, err = gzipWriter.Write(stdout.Bytes())
-	if err != nil {
-		s.logger.Error("Failed to compress backup for database %s: %v", database, err)
-		return fmt.Errorf("failed to compress backup: %w", err)
-	}
-	err = gzipWriter.Close()
-	if err != nil {
-		s.logger.Error("Failed to close gzip writer for database %s: %v", database, err)
-		return fmt.Errorf("failed to close gzip writer: %w", err)
-	}
-
-	originalSize := stdout.Len()
-	compressedSize := compressed.Len()
-	compressionRatio := float64(compressedSize) / float64(originalSize) * 100
-
-	s.logger.Info("Backup compressed: %s (original: %d bytes, compressed: %d bytes, ratio: %.1f%%)",
-		filename, originalSize, compressedSize, compressionRatio)
-
-	s.logger.Info("Storing backup file: %s", filename)
-	err = s.storage.Store(filename, &compressed)
-	if err != nil {
-		s.logger.Error("Failed to store backup for database %s: %v", database, err)
-		return fmt.Errorf("failed to store backup: %w", err)
-	}
-
-	s.logger.Info("Backup stored successfully: %s (%d bytes compressed)", filename, compressedSize)
+	s.logger.Info("Stored %s in %v (raw: %d bytes, compressed: %d bytes, ratio: %s)",
+		filename, time.Since(start).Round(time.Millisecond),
+		rawBytes, compressed.n, ratio(rawBytes, compressed.n))
 	return nil
 }
 
-func (s *Service) backupFullServer() error {
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	filename := fmt.Sprintf("full_dump_%s.sql.gz", timestamp)
+// ratio formats the compressed size as a percentage of the original, guarding
+// against the divide-by-zero an empty dump would otherwise produce.
+func ratio(raw, compressed int64) string {
+	if raw == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", float64(compressed)/float64(raw)*100)
+}
 
-	// Check if pg_dumpall is available - try multiple locations
-	var pgDumpallPath string
-	possiblePaths := []string{
-		"pg_dumpall",
-		"/usr/bin/pg_dumpall",
-		"/usr/libexec/postgresql/pg_dumpall",
+// pruneOldBackups deletes backups older than the configured retention window.
+// It only considers names this tool produces.
+func (s *Service) pruneOldBackups(ctx context.Context) error {
+	if s.cfg.RetentionDays <= 0 {
+		return nil
 	}
 
-	for _, path := range possiblePaths {
-		if _, err := exec.LookPath(path); err == nil {
-			pgDumpallPath = path
-			break
-		}
+	cutoff := time.Now().Add(-time.Duration(s.cfg.RetentionDays) * 24 * time.Hour)
+	objects, err := s.storage.List(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list stored backups: %w", err)
 	}
 
-	if pgDumpallPath == "" {
-		s.logger.Error("pg_dumpall not found in any expected location. Full dump requires PostgreSQL client tools to be installed.")
-		return fmt.Errorf("pg_dumpall not available")
-	}
-
-	s.logger.Info("Using pg_dumpall from: %s", pgDumpallPath)
-
-	// Use pg_dumpall to create a full cluster dump including all databases, roles, and tablespaces
-	cmd := exec.Command(pgDumpallPath,
-		"-h", s.dbConfig.Database.Host,
-		"-p", fmt.Sprintf("%d", s.dbConfig.Database.Port),
-		"-U", s.dbConfig.Database.User,
-		"--no-password",
+	var (
+		deleted  int
+		freed    int64
+		failures []error
 	)
-
-	if s.dbConfig.Database.Password != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PGPASSWORD=%s", s.dbConfig.Database.Password))
-		// Also add the current environment to ensure PATH is preserved
-		cmd.Env = append(cmd.Env, "PATH=/usr/libexec/postgresql:/usr/bin:/usr/sbin:/bin:/sbin")
-	} else {
-		cmd.Env = []string{"PATH=/usr/libexec/postgresql:/usr/bin:/usr/sbin:/bin:/sbin"}
+	for _, obj := range objects {
+		if !backupFilePattern.MatchString(obj.Name) {
+			continue
+		}
+		if !obj.ModTime.Before(cutoff) {
+			continue
+		}
+		if err := s.storage.Delete(ctx, obj.Name); err != nil {
+			failures = append(failures, fmt.Errorf("delete %q: %w", obj.Name, err))
+			continue
+		}
+		s.logger.Info("Pruned expired backup: %s (age %s)",
+			obj.Name, time.Since(obj.ModTime).Round(time.Hour))
+		deleted++
+		freed += obj.Size
 	}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	s.logger.Info("Executing pg_dumpall for full server dump")
-	start := time.Now()
-
-	err := cmd.Run()
-	if err != nil {
-		s.logger.Error("pg_dumpall failed: %v, stderr: %s", err, stderr.String())
-		s.logger.Error("This might indicate missing PostgreSQL client tools or insufficient permissions")
-		s.logger.Error("Consider using individual database backups (set full_dump: false) if pg_dumpall is not available")
-		return fmt.Errorf("pg_dumpall failed: %w", err)
+	if deleted > 0 {
+		s.logger.Info("Retention sweep removed %d backups older than %d days (%d bytes)",
+			deleted, s.cfg.RetentionDays, freed)
 	}
-
-	duration := time.Since(start)
-	s.logger.Info("pg_dumpall completed in %v", duration)
-
-	if stderr.Len() > 0 {
-		s.logger.Warning("pg_dumpall warnings: %s", stderr.String())
+	if len(failures) > 0 {
+		return errors.Join(failures...)
 	}
-
-	var compressed bytes.Buffer
-	gzipWriter := gzip.NewWriter(&compressed)
-	_, err = gzipWriter.Write(stdout.Bytes())
-	if err != nil {
-		s.logger.Error("Failed to compress full dump: %v", err)
-		return fmt.Errorf("failed to compress full dump: %w", err)
-	}
-	err = gzipWriter.Close()
-	if err != nil {
-		s.logger.Error("Failed to close gzip writer for full dump: %v", err)
-		return fmt.Errorf("failed to close gzip writer: %w", err)
-	}
-
-	originalSize := stdout.Len()
-	compressedSize := compressed.Len()
-	compressionRatio := float64(compressedSize) / float64(originalSize) * 100
-
-	s.logger.Info("Full dump compressed: %s (original: %d bytes, compressed: %d bytes, ratio: %.1f%%)",
-		filename, originalSize, compressedSize, compressionRatio)
-
-	s.logger.Info("Storing full dump file: %s", filename)
-	err = s.storage.Store(filename, &compressed)
-	if err != nil {
-		s.logger.Error("Failed to store full dump: %v", err)
-		return fmt.Errorf("failed to store full dump: %w", err)
-	}
-
-	s.logger.Info("Full dump stored successfully: %s (%d bytes compressed)", filename, compressedSize)
 	return nil
 }
