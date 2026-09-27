@@ -283,19 +283,26 @@ func (s *Service) runDump(ctx context.Context, cmd *exec.Cmd, filename, tool str
 		if err != nil {
 			dumpErr = err
 			pw.CloseWithError(err)
-			// Drain stdout first: Wait would otherwise block if the child
-			// filled the pipe buffer.
-			_, _ = io.Copy(io.Discard, stdout)
+			// Kill before Wait: nothing reads stdout, so the child would
+			// otherwise block on a full pipe and Wait would never return.
+			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 			return
 		}
 
 		rawBytes, err = io.Copy(gz, stdout)
 		copyErr := err
+		if copyErr != nil {
+			// Usually storage gave up and closed the pipe. Nobody will read
+			// stdout again, so the child blocks on a full pipe forever and
+			// Wait never returns -- holding the single-run slot and silently
+			// skipping every later backup. Kill it; the dump is lost anyway.
+			_ = cmd.Process.Kill()
+		}
 		closeErr := gz.Close()
 
-		// Wait only after stdout is drained, and only decide the stream was
-		// clean once the exit status is known.
+		// Wait only after stdout is drained (or the child killed), and only
+		// decide the stream was clean once the exit status is known.
 		waitErr := cmd.Wait()
 
 		switch {
@@ -320,7 +327,12 @@ func (s *Service) runDump(ctx context.Context, cmd *exec.Cmd, filename, tool str
 	<-done
 
 	// A failing dump surfaces at the provider as a read error, so report the
-	// dump's own error rather than blaming storage for it.
+	// dump's own error rather than blaming storage for it. The reverse holds
+	// too: when storage fails first, the writer sees storeErr on the pipe, and
+	// that is a storage failure, not a problem reading the dump.
+	if storeErr != nil && errors.Is(dumpErr, storeErr) {
+		return fmt.Errorf("failed to store backup %s: %w", filename, storeErr)
+	}
 	if dumpErr != nil {
 		return dumpErr
 	}

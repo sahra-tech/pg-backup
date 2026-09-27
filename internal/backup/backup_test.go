@@ -192,6 +192,46 @@ func TestRunDumpHandlesStorageFailure(t *testing.T) {
 	}
 }
 
+// earlyFailStorage gives up after reading only part of the stream, the way the
+// S3 uploader does when CreateMultipartUpload fails after buffering the first
+// part.
+type earlyFailStorage struct {
+	fakeStorage
+	err error
+}
+
+func (f *earlyFailStorage) Store(_ context.Context, _ string, data io.Reader) error {
+	_, _ = io.CopyN(io.Discard, data, 64*1024)
+	return f.err
+}
+
+// Regression: when storage failed without draining the pipe, the dump command
+// blocked forever on a full stdout, runDump never returned, and the held
+// single-run slot made every later scheduled backup skip.
+func TestRunDumpDoesNotHangWhenStorageFailsEarly(t *testing.T) {
+	store := &earlyFailStorage{err: errors.New("bucket unreachable")}
+	svc := testService(t, nil, store)
+
+	done := make(chan error, 1)
+	go func() {
+		// Produces output forever: only killing it can end the dump.
+		cmd := exec.Command("yes")
+		done <- svc.runDump(context.Background(), cmd, "db_2024-01-01_00-00-00.sql.gz", "fake_dump")
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "bucket unreachable") {
+			t.Fatalf("err = %v, want the storage error", err)
+		}
+		if !strings.Contains(err.Error(), "failed to store backup") {
+			t.Errorf("storage failure misreported as a dump failure: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("runDump hung after storage failed early")
+	}
+}
+
 func TestRunDumpRespectsContextCancellation(t *testing.T) {
 	svc := testService(t, nil, newFakeStorage())
 	ctx, cancel := context.WithCancel(context.Background())
