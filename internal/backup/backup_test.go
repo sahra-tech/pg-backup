@@ -316,7 +316,7 @@ func TestPruneDeletesOnlyExpiredBackups(t *testing.T) {
 	}
 
 	cfg := &config.Config{RetentionDays: 30}
-	if err := testService(t, cfg, store).pruneOldBackups(context.Background()); err != nil {
+	if err := testService(t, cfg, store).pruneOldBackups(context.Background(), nil); err != nil {
 		t.Fatalf("pruneOldBackups: %v", err)
 	}
 
@@ -331,7 +331,7 @@ func TestPruneDisabledWhenRetentionZero(t *testing.T) {
 		{Name: "ancient_2020-01-02_03-04-05_a1b2c3.sql.gz", ModTime: time.Now().Add(-10000 * time.Hour)},
 	}
 	cfg := &config.Config{RetentionDays: 0}
-	if err := testService(t, cfg, store).pruneOldBackups(context.Background()); err != nil {
+	if err := testService(t, cfg, store).pruneOldBackups(context.Background(), nil); err != nil {
 		t.Fatalf("pruneOldBackups: %v", err)
 	}
 	if len(store.deleted) != 0 {
@@ -358,6 +358,38 @@ func TestBackupAllSkipsPruneAfterFailure(t *testing.T) {
 	}
 	if len(store.deleted) != 0 {
 		t.Errorf("prune ran after a failed cycle, deleted: %v", store.deleted)
+	}
+}
+
+// A database that keeps failing must not stop retention for the others, but
+// its own old copies must survive.
+func TestPruneKeepsProtectedDatabases(t *testing.T) {
+	store := newFakeStorage()
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	store.objects = []storage.Object{
+		{Name: "good_2024-01-02_03-04-05_a1b2c3.sql.gz", ModTime: old},
+		{Name: "broken_2024-01-02_03-04-05_a1b2c3.sql.gz", ModTime: old},
+		// Prefix match must be exact, not a string prefix.
+		{Name: "broken_db_2024-01-02_03-04-05_a1b2c3.sql.gz", ModTime: old},
+	}
+
+	cfg := &config.Config{RetentionDays: 30}
+	protect := map[string]bool{"broken": true}
+	if err := testService(t, cfg, store).pruneOldBackups(context.Background(), protect); err != nil {
+		t.Fatalf("pruneOldBackups: %v", err)
+	}
+
+	want := map[string]bool{
+		"good_2024-01-02_03-04-05_a1b2c3.sql.gz":      true,
+		"broken_db_2024-01-02_03-04-05_a1b2c3.sql.gz": true,
+	}
+	if len(store.deleted) != len(want) {
+		t.Fatalf("deleted = %v, want %v", store.deleted, want)
+	}
+	for _, name := range store.deleted {
+		if !want[name] {
+			t.Errorf("deleted protected backup %q", name)
+		}
 	}
 }
 

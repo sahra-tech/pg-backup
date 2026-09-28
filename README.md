@@ -154,11 +154,11 @@ usually mean the storage endpoint or the CDN in front of it is unhealthy.
 
 ## Retention
 
-After every **successful** run, backups older than `retention_days` are deleted. Two guard rails
-apply:
+After every run, backups older than `PG_BACKUP_RETENTION_DAYS` are deleted. Two guard rails apply:
 
-- The sweep is skipped entirely if any part of the run failed, so old copies are never removed when
-  a fresh backup might be missing.
+- Old copies are never removed when a fresh backup might be missing. If individual databases fail,
+  their backups are kept and every other database is still pruned; if the failure's scope is unknown
+  (discovery failed, the full dump failed, or the run was cancelled) the sweep is skipped entirely.
 - Only files matching this tool's own naming pattern (`<name>_<timestamp>[_<suffix>].sql.gz`) are
   ever considered, so a shared bucket or directory is safe.
 

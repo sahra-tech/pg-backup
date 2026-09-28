@@ -47,34 +47,53 @@ func NewService(cfg *config.Config, store storage.Provider, log *logger.Logger) 
 	}
 }
 
-// BackupAll runs one backup cycle and, if nothing failed, prunes expired
-// backups. It returns the number of targets successfully backed up.
+// BackupAll runs one backup cycle and prunes expired backups. It returns the
+// number of targets successfully backed up.
 func (s *Service) BackupAll(ctx context.Context) (int, error) {
-	succeeded, err := s.runCycle(ctx)
+	succeeded, failed, err := s.runCycle(ctx)
 
-	if err != nil {
-		// Never prune after a partial cycle: we may not have written a fresh
-		// backup of everything we are about to delete old copies of.
+	switch {
+	case err == nil:
+		s.runPrune(ctx, nil)
+	case len(failed) == 0 || ctx.Err() != nil:
+		// We cannot tell which backups this cycle refreshed (discovery or the
+		// full dump failed, or we were cancelled), so delete nothing.
 		s.logger.Warning("Skipping retention sweep because this cycle reported failures")
-		return succeeded, err
+	default:
+		// Never prune a database we just failed to re-dump: its old copies may
+		// be the only good ones. Everything else was refreshed and is still
+		// pruned, so one persistently failing database cannot stop retention
+		// for the whole bucket.
+		s.logger.Warning("Retention sweep keeps all backups of failed databases: %s",
+			strings.Join(failed, ", "))
+		protect := make(map[string]bool, len(failed))
+		for _, name := range failed {
+			protect[name] = true
+		}
+		s.runPrune(ctx, protect)
 	}
+	return succeeded, err
+}
 
-	if pruneErr := s.pruneOldBackups(ctx); pruneErr != nil {
+func (s *Service) runPrune(ctx context.Context, protect map[string]bool) {
+	if pruneErr := s.pruneOldBackups(ctx, protect); pruneErr != nil {
 		// The backup itself succeeded; a failed sweep must not mask that.
 		s.logger.Error("Retention sweep failed: %v", pruneErr)
 	}
-	return succeeded, nil
 }
 
-func (s *Service) runCycle(ctx context.Context) (int, error) {
+// runCycle backs up every target. On error, failed names the databases whose
+// backup did not complete; it is empty when the scope of the failure is
+// unknown.
+func (s *Service) runCycle(ctx context.Context) (int, []string, error) {
 	if s.cfg.FullDump {
 		s.logger.Info("Full dump mode enabled, creating single backup file for entire server")
 		if err := s.backupFullServer(ctx); err != nil {
 			s.logger.Error("Failed to perform full dump: %v", err)
-			return 0, err
+			return 0, nil, err
 		}
 		s.logger.Info("Full dump completed successfully")
-		return 1, nil
+		return 1, nil, nil
 	}
 
 	databases := s.cfg.Database.Databases
@@ -84,7 +103,7 @@ func (s *Service) runCycle(ctx context.Context) (int, error) {
 		discovered, err := s.discoverDatabases(ctx)
 		if err != nil {
 			s.logger.Error("Failed to discover databases: %v", err)
-			return 0, err
+			return 0, nil, err
 		}
 		databases = discovered
 		s.logger.Info("Discovered %d databases: %s", len(databases), strings.Join(databases, ", "))
@@ -94,6 +113,7 @@ func (s *Service) runCycle(ctx context.Context) (int, error) {
 	// the first error would silently skip every remaining database.
 	var (
 		succeeded int
+		failed    []string
 		failures  []error
 	)
 	for _, database := range databases {
@@ -105,6 +125,7 @@ func (s *Service) runCycle(ctx context.Context) (int, error) {
 		s.logger.Info("Starting backup for database: %s", database)
 		if err := s.backupDatabase(ctx, database); err != nil {
 			s.logger.Error("Failed to backup database %s: %v", database, err)
+			failed = append(failed, database)
 			failures = append(failures, fmt.Errorf("database %q: %w", database, err))
 			continue
 		}
@@ -113,10 +134,10 @@ func (s *Service) runCycle(ctx context.Context) (int, error) {
 	}
 
 	if len(failures) > 0 {
-		return succeeded, fmt.Errorf("%d of %d databases failed: %w",
+		return succeeded, failed, fmt.Errorf("%d of %d databases failed: %w",
 			len(failures), len(databases), errors.Join(failures...))
 	}
-	return succeeded, nil
+	return succeeded, nil, nil
 }
 
 // quoteDSNValue renders a libpq connection-string value safely. Without this a
@@ -360,8 +381,9 @@ func ratio(raw, compressed int64) string {
 }
 
 // pruneOldBackups deletes backups older than the configured retention window.
-// It only considers names this tool produces.
-func (s *Service) pruneOldBackups(ctx context.Context) error {
+// It only considers names this tool produces, and never touches backups whose
+// database name is in protect.
+func (s *Service) pruneOldBackups(ctx context.Context, protect map[string]bool) error {
 	if s.cfg.RetentionDays <= 0 {
 		return nil
 	}
@@ -375,13 +397,19 @@ func (s *Service) pruneOldBackups(ctx context.Context) error {
 	var (
 		deleted  int
 		freed    int64
+		expired  int
 		failures []error
 	)
 	for _, obj := range objects {
-		if !backupFilePattern.MatchString(obj.Name) {
+		loc := backupFilePattern.FindStringIndex(obj.Name)
+		if loc == nil {
 			continue
 		}
 		if !obj.ModTime.Before(cutoff) {
+			continue
+		}
+		expired++
+		if protect[obj.Name[:loc[0]]] {
 			continue
 		}
 		if err := s.storage.Delete(ctx, obj.Name); err != nil {
@@ -394,10 +422,10 @@ func (s *Service) pruneOldBackups(ctx context.Context) error {
 		freed += obj.Size
 	}
 
-	if deleted > 0 {
-		s.logger.Info("Retention sweep removed %d backups older than %d days (%d bytes)",
-			deleted, s.cfg.RetentionDays, freed)
-	}
+	// Always report, so an operator can confirm from the logs that the sweep
+	// ran even when there was nothing to delete.
+	s.logger.Info("Retention sweep: %d objects listed, %d older than %d days, %d removed (%d bytes)",
+		len(objects), expired, s.cfg.RetentionDays, deleted, freed)
 	if len(failures) > 0 {
 		return errors.Join(failures...)
 	}
